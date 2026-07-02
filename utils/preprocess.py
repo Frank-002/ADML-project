@@ -1,4 +1,5 @@
 from typing import Dict, Any, Tuple
+import torch
 import torch.nn.functional as F
 from torchvision import transforms
 
@@ -61,7 +62,7 @@ class PreProcess(object):
             sample[f"{key}_img"] = img_padded.squeeze(0)
             sample[f"{key}_kps"] = self._resize_points(sample[f"{key}_kps"], sy, sx)
             sample[f"{key}_bbox"] = self._resize_bbox_xyxy(sample[f"{key}_bbox"], sy, sx)
-            sample[f"{key}_nopad_size"] = img_resized.size()
+            sample[f"{key}_nopad_size"] = torch.tensor([newh, neww])
 
 
         return sample

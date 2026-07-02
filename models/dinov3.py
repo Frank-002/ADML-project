@@ -1,16 +1,27 @@
+from pathlib import Path
+
 import torch
-from torchvision import transforms
 
 
-class DinoV2:
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+class DinoV3:
     def __init__(
             self,
             *,
             device: torch.device,
+            checkpoint: Path,
             trainable: bool = False
     ):
         self.device = device
-        model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
+
+        model = torch.hub.load(
+            str(PROJECT_ROOT / "dinov3-git"),
+            'dinov3_vitb16',
+            source='local',
+            weights=str(checkpoint))
+
         if trainable:
             self.model = model.to(self.device).train()
         else:
@@ -30,10 +41,7 @@ class DinoV2:
         B, N, C = patch_features.shape
         _, _, H_img, W_img = image.shape
 
-        if isinstance(self.patch_size, tuple):
-            patch_h, patch_w = self.patch_size
-        else:
-            patch_h = patch_w = self.patch_size
+        patch_h = patch_w = self.patch_size
 
         H_feat = H_img // patch_h
         W_feat = W_img // patch_w

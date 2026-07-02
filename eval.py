@@ -6,6 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from models.dinov3 import DinoV3
 from models.sam import SAM
 from utils import preprocess
 from utils.featuremap import dense_correspondence
@@ -53,7 +54,11 @@ def main():
             model = SAM(device=device, checkpoint=args.checkpoint)
             preprocess = PreProcess(long_side_length=1024, apply_norm=False)
         case "DINOV3":
-            pass
+            model = DinoV3(device=device, checkpoint=args.checkpoint)
+            preprocess = PreProcess(long_side_length=768, apply_norm=True)
+        case _:
+            raise NotImplementedError
+
 
     test_dataset = SPairDataset(pair_ann_path, layout_path, image_path, dataset_size, pck_alpha, datatype='test', preprocess=preprocess)
     test_dataloader = DataLoader(test_dataset, num_workers=1, batch_size=1)
@@ -72,19 +77,7 @@ def main():
             src_image_size_pad = src_img.shape[-2:]  # (H_pad, W_pad)
             trg_image_size_pad = trg_img.shape[-2:]  # (H_pad, W_pad)
 
-            trg_nopad_size = batch["trg_nopad_size"]
-
-            # Caso DataLoader con img_resized.size() = torch.Size([C, H, W])
-            # spesso collato come lista: [tensor([C]), tensor([H]), tensor([W])]
-
-            #if isinstance(trg_nopad_size, list):
-            #    trg_nopad_size = [
-            #        int(x[0]) if torch.is_tensor(x) else int(x)
-            #        for x in trg_nopad_size
-            #    ]
-
-            # tieni solo H, W, scartando C
-            #trg_nopad_size = tuple(trg_nopad_size[-2:])
+            trg_nopad_size = batch["trg_nopad_size"]  # [B, 2] -> (H_nopad, W_nopad)
 
             pred_trg_kps = dense_correspondence(
                 src_feat=src_featuremap,
@@ -92,7 +85,7 @@ def main():
                 src_kps=src_kps,
                 src_image_size_pad=src_image_size_pad,
                 trg_image_size_pad=trg_image_size_pad,
-                trg_size_nopad=None,  #TODO: nel caso eliminare trg_size_nopad
+                trg_size_nopad=(int(trg_nopad_size[0, 0]), int(trg_nopad_size[0, 1])),
             )
 
             out = {
