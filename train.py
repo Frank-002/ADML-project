@@ -2,7 +2,7 @@ import argparse
 import math
 import sys
 from pathlib import Path
-import psutil
+
 import torch
 import wandb
 from torch.utils.data import DataLoader
@@ -50,7 +50,7 @@ def parse_args():
     common.add_argument("--no-amp", dest="amp", action="store_false", help="disable bf16 mixed precision and train in fp32 (default: amp on, validation always fp32)")
     common.add_argument("--weight-decay", type=float, default=0.01)
     common.add_argument("--max-grad-norm", type=float, default=1.0)
-    common.add_argument("--num-workers", type=int, default=psutil.cpu_count(logical=False), help="dataloader workers; raise it if GPU utilization is spiky")
+    common.add_argument("--num-workers", type=int, default=4, help="dataloader workers; raise it if GPU utilization is spiky, lower it if system RAM fills up (train+val keep 2x this many worker processes alive)")
     common.add_argument("--wandb-project", type=str, default="ADML-project")
 
     parser = argparse.ArgumentParser()
