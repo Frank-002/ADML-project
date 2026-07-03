@@ -1,10 +1,61 @@
-import math
-
 import torch
 import torch.nn.functional as F
 
 def normalize_features(feat: torch.Tensor) -> torch.Tensor:
     return F.normalize(feat, p=2, dim=1)
+
+def keypoints_to_feature_indices(
+    kps: torch.Tensor,
+    feat_size: tuple[int, int],
+    image_size_pad: tuple[int, int],
+) -> torch.Tensor:
+    """
+    kps: [B, K, 2] coordinate (x, y) nello spazio della padded image
+    feat_size: (Hf, Wf)
+    image_size_pad: (H_pad, W_pad)
+
+    return: [B, K] indice piatto (y * Wf + x) del patch che contiene il keypoint
+
+    Convenzione area / centro-patch (align_corners=False), inversa di
+    feature_indices_to_keypoints.
+    """
+    Hf, Wf = feat_size
+    H_pad, W_pad = image_size_pad
+
+    x_f = (kps[..., 0] + 0.5) * Wf / W_pad - 0.5
+    y_f = (kps[..., 1] + 0.5) * Hf / H_pad - 0.5
+
+    x_idx = x_f.round().long().clamp(0, Wf - 1)
+    y_idx = y_f.round().long().clamp(0, Hf - 1)
+
+    return y_idx * Wf + x_idx
+
+def feature_indices_to_keypoints(
+    idx: torch.Tensor,
+    feat_size: tuple[int, int],
+    image_size_pad: tuple[int, int],
+) -> torch.Tensor:
+    """
+    idx: [B, K] indice piatto (y * Wf + x) sulla griglia feature
+    feat_size: (Hf, Wf)
+    image_size_pad: (H_pad, W_pad)
+
+    return: [B, K, 2] coordinate (x, y) del centro patch nello spazio padded
+
+    Convenzione area / centro-patch (align_corners=False): la cella feature j
+    corrisponde al centro patch ((j + 0.5) * stride - 0.5). Inversa di
+    keypoints_to_feature_indices.
+    """
+    Hf, Wf = feat_size
+    H_pad, W_pad = image_size_pad
+
+    y_feat = idx // Wf
+    x_feat = idx % Wf
+
+    x_img = (x_feat.float() + 0.5) * W_pad / Wf - 0.5
+    y_img = (y_feat.float() + 0.5) * H_pad / Hf - 0.5
+
+    return torch.stack([x_img, y_img], dim=-1)
 
 def sample_features_at_keypoints(
     feat: torch.Tensor,
@@ -49,32 +100,33 @@ def sample_features_at_keypoints(
 def make_valid_feature_mask(
     feat: torch.Tensor,
     image_size_pad: tuple[int, int],
-    size_nopad: tuple[int, int],
+    size_nopad: tuple[int, int] | torch.Tensor,
 ) -> torch.Tensor:
     """
     feat: [B, C, Hf, Wf]
     image_size_pad: (H_pad, W_pad)
-    size_nopad: (H_no_pad, W_no_pad)
+    size_nopad: (H_no_pad, W_no_pad) unica per tutto il batch,
+                oppure tensore [B, 2] per-sample
 
-    return: [B, 1, Hf, Wf]
+    return: [B, 1, Hf, Wf] bool, True sui patch non di padding
     """
 
     B, _, Hf, Wf = feat.shape
     H_pad, W_pad = image_size_pad
-    H_no_pad, W_no_pad = size_nopad
 
-    H_keep = math.ceil(Hf * H_no_pad / H_pad)
-    W_keep = math.ceil(Wf * W_no_pad / W_pad)
+    if not torch.is_tensor(size_nopad):
+        size_nopad = torch.tensor(size_nopad)
+    size_nopad = size_nopad.to(feat.device).float().reshape(-1, 2).expand(B, 2)
 
-    mask = torch.zeros(
-        B, 1, Hf, Wf,
-        dtype=torch.bool,
-        device=feat.device,
-    )
+    h_keep = torch.ceil(Hf * size_nopad[:, 0] / H_pad).long()  # [B]
+    w_keep = torch.ceil(Wf * size_nopad[:, 1] / W_pad).long()  # [B]
 
-    mask[:, :, :H_keep, :W_keep] = True
+    rows = torch.arange(Hf, device=feat.device)[None, :] < h_keep[:, None]  # [B, Hf]
+    cols = torch.arange(Wf, device=feat.device)[None, :] < w_keep[:, None]  # [B, Wf]
 
-    return mask
+    mask = rows[:, :, None] & cols[:, None, :]  # [B, Hf, Wf]
+
+    return mask.unsqueeze(1)
 
 def dense_correspondence(
     src_feat: torch.Tensor,
@@ -122,16 +174,10 @@ def dense_correspondence(
 
     nn_idx = sim.argmax(dim=-1)  # [B, K]
 
-    y_feat = nn_idx // Wt
-    x_feat = nn_idx % Wt
-
-    H_trg_pad, W_trg_pad = trg_image_size_pad
-
-    # Inversa della convenzione area / centro-patch (align_corners=False):
-    # la cella feature j corrisponde al centro patch ((j + 0.5) * stride - 0.5).
-    x_img = (x_feat.float() + 0.5) * W_trg_pad / Wt - 0.5
-    y_img = (y_feat.float() + 0.5) * H_trg_pad / Ht - 0.5
-
-    pred_trg_kps = torch.stack([x_img, y_img], dim=-1)  # [B, K, 2]
+    pred_trg_kps = feature_indices_to_keypoints(
+        idx=nn_idx,
+        feat_size=(Ht, Wt),
+        image_size_pad=trg_image_size_pad,
+    )  # [B, K, 2]
 
     return pred_trg_kps

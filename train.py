@@ -1,28 +1,389 @@
 import argparse
+import math
 import sys
 from pathlib import Path
+
+import torch
+import wandb
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from models.dinov2 import DinoV2
+from models.dinov3 import DinoV3
+from models.sam import SAM
+from utils.preprocess import PreProcess
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from data.SPairDataset import SPairDataset
+from utils.evaluator import evaluate_one_epoch
+from utils.trainer import train_one_epoch
+
+
 def parse_args():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--checkpoint", type=Path, required=False, help="path to checkpoint")
+
+    # W&B sweep (hyperparameter search on SPair small, runs before the actual training)
+    common.add_argument("--skip-sweep", action="store_true", help="skip the hyperparameter search and use the CLI hyperparameters directly")
+    common.add_argument("--sweep-id", type=str, default=None, help="id of an existing sweep to join")
+    common.add_argument("--sweep-count", type=int, default=20, help="number of sweep runs")
+
+    # Hyperparameters: lr / unfreeze-layers / cosine-decay / batch-size are
+    # proposed by W&B during the sweep; the CLI values are used only with --skip-sweep
+    common.add_argument("--max-epochs", type=int, default=20, help="maximum number of epochs (also defines the cosine T_max)")
+    common.add_argument("--patience", type=int, default=3, help="early stopping: epochs without val PCK@0.10 improvement")
+    common.add_argument("--lr", type=float, default=1e-5)
+    common.add_argument("--unfreeze-layers", type=int, default=2, help="blocks to unfreeze starting from the head")
+    common.add_argument("--cosine-decay", type=float, default=0.01, help="final lr = lr * cosine_decay")
+    common.add_argument("--tau", type=float, default=0.05, help="InfoNCE temperature")
+    common.add_argument("--batch-size", type=int, default=1, help="training batch size (validation always uses 1)")
+    common.add_argument("--grad-accum", type=int, default=8)
+    common.add_argument("--weight-decay", type=float, default=0.01)
+    common.add_argument("--max-grad-norm", type=float, default=1.0)
+    common.add_argument("--num-workers", type=int, default=4, help="dataloader workers; raise it if GPU utilization is spiky")
+    common.add_argument("--wandb-project", type=str, default="ADML-project")
+
     parser = argparse.ArgumentParser()
 
     model = parser.add_subparsers(dest='model', required=True)
-    dinov2 = model.add_parser("DINOV2")
-    dinov2.add_argument("--checkpoint", type=Path, required=False, help="path to checkpoint")
-
-    dinov3 = model.add_parser("DINOV3")
-    dinov3.add_argument("--checkpoint", type=Path, required=False, help="path to checkpoint")
-
-    sam = model.add_parser("SAM")
-    sam.add_argument("--checkpoint", type=Path, required=False, help="path to checkpoint")
+    model.add_parser("DINOV2", parents=[common])
+    model.add_parser("DINOV3", parents=[common])
+    model.add_parser("SAM", parents=[common])
 
     return parser.parse_args()
 
+
+def build_model_and_preprocess(model_name, checkpoint, device):
+    # In the sweep each run must start from a fresh model, so the
+    # construction lives in a function rather than in main
+    match (model_name):
+        case "DINOV2":
+            model = DinoV2(device=device, trainable=True)
+            preprocess = PreProcess(long_side_length=518, apply_norm=True)
+        case "SAM":
+            model = SAM(device=device, checkpoint=checkpoint, trainable=True)
+            preprocess = PreProcess(long_side_length=1024, apply_norm=False)
+        case "DINOV3":
+            model = DinoV3(device=device, checkpoint=checkpoint, trainable=True)
+            preprocess = PreProcess(long_side_length=768, apply_norm=True)
+        case _:
+            raise NotImplementedError
+
+    return model, preprocess
+
+
+def get_backbone(model, model_name) -> torch.nn.Module:
+    if model_name == "SAM":
+        return model.model.model  # SamPredictor -> Sam
+    return model.model
+
+
+def unfreeze_last_layers(model, model_name, num_layers) -> list:
+    """
+    Freeze the whole backbone and re-enable only the last num_layers blocks
+    (starting from the head) plus the final modules (norm / neck).
+
+    return: list of trainable parameters for the optimizer
+    """
+    backbone = get_backbone(model, model_name)
+
+    for p in backbone.parameters():
+        p.requires_grad_(False)
+
+    if model_name in ("DINOV2", "DINOV3"):
+        blocks = backbone.blocks
+        tail = list(blocks[len(blocks) - num_layers:]) + [backbone.norm]
+    elif model_name == "SAM":
+        encoder = backbone.image_encoder
+        blocks = encoder.blocks
+        tail = list(blocks[len(blocks) - num_layers:]) + [encoder.neck]
+    else:
+        raise NotImplementedError
+
+    for module in tail:
+        for p in module.parameters():
+            p.requires_grad_(True)
+
+    return [p for p in backbone.parameters() if p.requires_grad]
+
+
+def collate_train(batch):
+    """
+    Collate for training with batch_size > 1.
+
+    Images are already padded to a fixed square by PreProcess, so they stack
+    directly. Keypoints vary in number per pair (SPair), so they are padded to
+    the batch max and a boolean kps_valid_mask marks the real ones. Only the
+    fields consumed by dense_infonce_loss are kept.
+    """
+    src_img = torch.stack([b["src_img"] for b in batch])
+    trg_img = torch.stack([b["trg_img"] for b in batch])
+    src_nopad_size = torch.stack([b["src_nopad_size"] for b in batch])
+    trg_nopad_size = torch.stack([b["trg_nopad_size"] for b in batch])
+
+    B = len(batch)
+    max_k = max(b["src_kps"].shape[0] for b in batch)
+
+    src_kps = torch.full((B, max_k, 2), -1.0)
+    trg_kps = torch.full((B, max_k, 2), -1.0)
+    for i, b in enumerate(batch):
+        k = b["src_kps"].shape[0]
+        src_kps[i, :k] = b["src_kps"]
+        trg_kps[i, :k] = b["trg_kps"]
+
+    # Valid where both src and trg keypoints are set: excludes the -1 padding
+    # (and any -1 "invalid" keypoint from the annotations)
+    kps_valid_mask = (
+        (src_kps[..., 0] >= 0) & (src_kps[..., 1] >= 0) &
+        (trg_kps[..., 0] >= 0) & (trg_kps[..., 1] >= 0)
+    )
+
+    return {
+        "src_img": src_img,
+        "trg_img": trg_img,
+        "src_kps": src_kps,
+        "trg_kps": trg_kps,
+        "src_nopad_size": src_nopad_size,
+        "trg_nopad_size": trg_nopad_size,
+        "kps_valid_mask": kps_valid_mask,
+    }
+
+
+def build_dataloaders(preprocess, dataset_size, num_workers, batch_size):
+    pair_ann_path = PROJECT_ROOT / "dataset" / "SPair-71k" / "PairAnnotation"
+    layout_path = PROJECT_ROOT / "dataset" / "SPair-71k" / "Layout"
+    image_path = PROJECT_ROOT / "dataset" / "SPair-71k" / "JPEGImages"
+    pck_alpha = [0.05, 0.1, 0.2]
+
+    train_dataset = SPairDataset(pair_ann_path, layout_path, image_path, dataset_size, pck_alpha, datatype='trn', preprocess=preprocess)
+    val_dataset = SPairDataset(pair_ann_path, layout_path, image_path, dataset_size, pck_alpha, datatype='val', preprocess=preprocess)
+
+    # pin_memory speeds up CPU->GPU transfers; persistent_workers avoids
+    # respawning workers at every epoch (expensive on Windows)
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": True,
+        "persistent_workers": num_workers > 0,
+    }
+
+    # Validation always uses batch_size=1 (variable keypoints + per-sample
+    # nopad mask, as required by evaluate_one_epoch)
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_train, **loader_kwargs)
+    val_dataloader = DataLoader(val_dataset, batch_size=1, **loader_kwargs)
+
+    return train_dataloader, val_dataloader
+
+
+def run_training(args, *, lr, unfreeze_layers, cosine_decay, batch_size, dataset_size, save_path=None) -> float:
+    """
+    Fine-tune the model with validation at the end of each epoch.
+
+    return: best PCK@0.10 (per point) on the validation set
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    model, preprocess = build_model_and_preprocess(args.model, args.checkpoint, device)
+    backbone = get_backbone(model, args.model)
+
+    trainable_params = unfreeze_last_layers(model, args.model, unfreeze_layers)
+    n_trainable = sum(p.numel() for p in trainable_params)
+    print(f"{args.model}: last {unfreeze_layers} layers unfrozen -> {n_trainable / 1e6:.1f}M trainable parameters")
+
+    train_dataloader, val_dataloader = build_dataloaders(preprocess, dataset_size, args.num_workers, batch_size)
+
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=args.weight_decay)
+
+    # Cosine decay over optimizer steps (scheduler.step() is called by
+    # train_one_epoch after every optimizer.step()). T_max is defined on the
+    # maximum number of epochs: with early stopping the cosine stays partial
+    steps_per_epoch = math.ceil(len(train_dataloader) / args.grad_accum)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.max_epochs * steps_per_epoch,
+        eta_min=lr * cosine_decay,
+    )
+
+    best_pck = 0.0
+    epochs_no_improve = 0
+
+    epoch_bar = tqdm(range(args.max_epochs), desc=f"{args.model} epochs", unit="epoch")
+    for epoch in epoch_bar:
+        backbone.train()
+        avg_loss = train_one_epoch(
+            model=model,
+            dataloader=train_dataloader,
+            optimizer=optimizer,
+            loss_kwargs={"tau": args.tau},
+            scheduler=scheduler,
+            grad_accum_steps=args.grad_accum,
+            max_grad_norm=args.max_grad_norm,
+            epoch=epoch,
+            log_wandb=True,
+        )
+
+        backbone.eval()
+        metrics = evaluate_one_epoch(
+            model=model,
+            dataloader=val_dataloader,
+            method_name=f"{args.model} (epoch {epoch})",
+            log_wandb=False,
+        )
+
+        pck = {name: metrics["point"][name]["mean"] for name in ("0.05", "0.10", "0.20")}
+
+        epoch_bar.set_postfix(loss=f"{avg_loss:.3f}", pck10=f"{pck['0.10']:.2f}")
+
+        wandb.log({
+            "epoch": epoch,
+            "train/avg_loss": avg_loss,
+            "val/pck_0.05": pck["0.05"],
+            "val/pck_0.10": pck["0.10"],
+            "val/pck_0.20": pck["0.20"],
+        })
+
+        if pck["0.10"] > best_pck:
+            best_pck = pck["0.10"]
+            epochs_no_improve = 0
+
+            if save_path is not None:
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save({
+                    "model": args.model,
+                    "epoch": epoch,
+                    "val_pck_0.10": best_pck,
+                    "config": {
+                        "lr": lr,
+                        "unfreeze_layers": unfreeze_layers,
+                        "cosine_decay": cosine_decay,
+                        "tau": args.tau,
+                    },
+                    "state_dict": backbone.state_dict(),
+                }, save_path)
+                print(f"New best (val PCK@0.10 = {best_pck:.2f}): checkpoint saved to {save_path}")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= args.patience:
+                print(f"Early stopping at epoch {epoch}: val PCK@0.10 stuck at {best_pck:.2f} for {args.patience} epochs")
+                break
+
+    if wandb.run is not None:
+        wandb.run.summary["best/val_pck_0.10"] = best_pck
+        wandb.run.summary["stopped_epoch"] = epoch
+
+    return best_pck
+
+
+def sweep_entry(args):
+    """Single sweep run: hyperparameters come from wandb.config."""
+    with wandb.init():
+        config = wandb.config
+        run_training(
+            args,
+            lr=config.lr,
+            unfreeze_layers=config.unfreeze_layers,
+            cosine_decay=config.cosine_decay,
+            batch_size=config.batch_size,
+            dataset_size='small',  # hyperparameter search on SPair small
+        )
+
+
+def run_sweep(args) -> dict:
+    """
+    Hyperparameter search with a W&B sweep on SPair small.
+
+    return: hyperparameters of the best run (highest val/pck_0.10)
+    """
+    sweep_config = {
+        "name": f"{args.model}-finetune",
+        "method": "bayes",
+        "metric": {"name": "val/pck_0.10", "goal": "maximize"},
+        "parameters": {
+            "lr": {"distribution": "log_uniform_values", "min": 1e-6, "max": 3e-4},
+            "unfreeze_layers": {"values": [1, 2, 3, 4, 5]},
+            "cosine_decay": {"values": [0.0, 0.01, 0.1]},
+            "batch_size": {"values": [2, 4, 8, 16, 32]},
+        },
+        # Hyperband pruning: at epochs 2, 6, 18 (min_iter * eta^k) runs whose
+        # val/pck_0.10 is in the bottom tier vs their peers get terminated
+        "early_terminate": {
+            "type": "hyperband",
+            "min_iter": 2,
+            "eta": 3,
+        },
+    }
+
+    print(f"Launching W&B sweep for {args.model}: {args.sweep_count} runs on SPair small")
+    sweep_id = args.sweep_id or wandb.sweep(sweep_config, project=args.wandb_project)
+    wandb.agent(sweep_id, function=lambda: sweep_entry(args), count=args.sweep_count, project=args.wandb_project)
+
+    # Fetch the best run of the finished sweep (ranked by the sweep metric)
+    api = wandb.Api()
+    sweep = api.sweep(f"{api.default_entity}/{args.wandb_project}/{sweep_id}")
+    best_run = sweep.best_run()
+    print(f"Sweep complete. Best run: {best_run.name} (val PCK@0.10 = {best_run.summary.get('best/val_pck_0.10', 'n/a')})")
+
+    return {
+        "lr": best_run.config["lr"],
+        "unfreeze_layers": best_run.config["unfreeze_layers"],
+        "cosine_decay": best_run.config["cosine_decay"],
+        "batch_size": best_run.config["batch_size"],
+    }
+
+
 def main():
     args = parse_args()
+
+    if args.skip_sweep:
+        # No search: use the CLI hyperparameters directly
+        best_hparams = {
+            "lr": args.lr,
+            "unfreeze_layers": args.unfreeze_layers,
+            "cosine_decay": args.cosine_decay,
+            "batch_size": args.batch_size,
+        }
+    else:
+        # Hyperparameter search on SPair small before the actual training
+        best_hparams = run_sweep(args)
+
+    # Actual training on SPair large with the selected hyperparameters
+    config = {
+        **best_hparams,
+        "tau": args.tau,
+        "max_epochs": args.max_epochs,
+        "patience": args.patience,
+        "grad_accum": args.grad_accum,
+        "weight_decay": args.weight_decay,
+        "dataset_size": "large",
+    }
+
+    # Log the selected hyperparameters to console and W&B before training
+    print(f"Starting {args.model} fine-tuning with the selected hyperparameters:")
+    for key, value in config.items():
+        print(f"  {key}: {value}")
+
+    wandb.init(
+        project=args.wandb_project,
+        name=f"{args.model}-finetune",
+        config=config,
+    )
+
+    save_path = PROJECT_ROOT / "checkpoints" / "finetune" / f"{args.model.lower()}_best.pth"
+    best_pck = run_training(
+        args,
+        lr=best_hparams["lr"],
+        unfreeze_layers=best_hparams["unfreeze_layers"],
+        cosine_decay=best_hparams["cosine_decay"],
+        batch_size=best_hparams["batch_size"],
+        dataset_size='large',
+        save_path=save_path,
+    )
+
+    print(f"Training complete. Best val PCK@0.10: {best_pck:.2f}")
+    wandb.finish()
+
 
 if __name__ == '__main__':
     main()

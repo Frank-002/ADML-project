@@ -13,6 +13,7 @@ class SAM():
             trainable: bool = False
     ):
         self.device = device
+        self.trainable = trainable
         model = sam_model_registry["vit_b"](checkpoint=checkpoint)
         if trainable:
             model.to(self.device).train()
@@ -27,6 +28,12 @@ class SAM():
             self,
             image: torch.Tensor,
     ) -> torch.Tensor:
-        self.model.set_torch_image(image.to(self.device), (1024, 1024))
-        features = self.model.get_image_embedding()
+        if self.trainable:
+            # Replica SamPredictor.set_torch_image (preprocess + image_encoder)
+            # senza il suo @torch.no_grad(), che bloccherebbe il fine-tuning
+            image = self.model.model.preprocess(image.to(self.device))
+            features = self.model.model.image_encoder(image)
+        else:
+            self.model.set_torch_image(image.to(self.device), (1024, 1024))
+            features = self.model.get_image_embedding()
         return features
