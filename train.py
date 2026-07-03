@@ -22,8 +22,8 @@ from data.SPairDataset import SPairDataset
 from utils.evaluator import evaluate_one_epoch
 from utils.trainer import train_one_epoch
 
-# Largest per-forward batch that fits in ~12 GB of VRAM in fp32, sized for the
-# highest unfreeze setting of the sweep; doubled when --amp halves the
+# Largest per-forward batch that fits in ~12 GB of VRAM in fp32, sized for
+# --unfreeze-layers up to 5; doubled when --amp halves the
 # activations, or overridden with --real-batch on other GPUs. The effective
 # batch is reached via gradient accumulation on top of it.
 MAX_REAL_BATCH = {"DINOV2": 8, "DINOV3": 4, "SAM": 2}
@@ -36,14 +36,14 @@ def parse_args():
     # W&B sweep (hyperparameter search on SPair small, runs before the actual training)
     common.add_argument("--skip-sweep", action="store_true", help="skip the hyperparameter search and use the CLI hyperparameters directly")
     common.add_argument("--sweep-id", type=str, default=None, help="id of an existing sweep to join")
-    common.add_argument("--sweep-count", type=int, default=20, help="number of sweep runs")
+    common.add_argument("--sweep-count", type=int, default=12, help="number of sweep runs")
 
-    # Hyperparameters: lr / unfreeze-layers / tau / effective-batch are
-    # proposed by W&B during the sweep; the CLI values are used only with --skip-sweep
+    # Hyperparameters: lr / tau / effective-batch are proposed by W&B during
+    # the sweep; the CLI values are used only with --skip-sweep
     common.add_argument("--max-epochs", type=int, default=20, help="maximum number of epochs (also defines the cosine T_max)")
     common.add_argument("--patience", type=int, default=3, help="early stopping: epochs without val PCK@0.10 improvement")
     common.add_argument("--lr", type=float, default=1e-5)
-    common.add_argument("--unfreeze-layers", type=int, default=2, help="blocks to unfreeze starting from the head")
+    common.add_argument("--unfreeze-layers", type=int, required=True, help="blocks to unfreeze starting from the head, fixed for the whole pipeline (sweep + final training); relaunch with a different value to compare")
     common.add_argument("--cosine-decay", type=float, default=0.01, help="final lr = lr * cosine_decay")
     common.add_argument("--tau", type=float, default=0.05, help="InfoNCE temperature")
     common.add_argument("--effective-batch", type=int, default=32, help="effective training batch, reached via gradient accumulation (validation always uses 1)")
@@ -309,6 +309,9 @@ def run_training(args, *, lr, unfreeze_layers, tau, effective_batch, dataset_siz
                 break
 
     if wandb.run is not None:
+        # La summary di default e' l'ultimo wandb.log: best_run() e il ranking
+        # dello sweep leggono questa chiave, quindi la sovrascriviamo col best
+        wandb.run.summary["val/pck_0.10"] = best_pck
         wandb.run.summary["best/val_pck_0.10"] = best_pck
         wandb.run.summary["stopped_epoch"] = epoch
 
@@ -318,14 +321,15 @@ def run_training(args, *, lr, unfreeze_layers, tau, effective_batch, dataset_siz
 def sweep_entry(args):
     """Single sweep run: hyperparameters come from wandb.config."""
     with wandb.init():
-        # Summary = max storico invece dell'ultimo valore loggato: bayes e
-        # best_run() confrontano le run sul best, non sull'epoca di early stop
+        # Summary = max storico per bayes/UI; best_run() pero' ignora
+        # define_metric e legge la summary raw, che run_training sovrascrive
+        # col best della run a fine training
         wandb.define_metric("val/pck_0.10", summary="max")
         config = wandb.config
         run_training(
             args,
             lr=config.lr,
-            unfreeze_layers=config.unfreeze_layers,
+            unfreeze_layers=args.unfreeze_layers,  # fisso da CLI per tutta la pipeline
             tau=config.tau,
             effective_batch=config.effective_batch,
             dataset_size='small',  # hyperparameter search on SPair small
@@ -346,7 +350,6 @@ def run_sweep(args) -> dict:
             # lr cap at 1e-4: above that a fine-tune wrecks the pretrained
             # features in a few epochs and the run just burns sweep budget
             "lr": {"distribution": "log_uniform_values", "min": 1e-6, "max": 1e-4},
-            "unfreeze_layers": {"values": [1, 2, 3, 4, 5]},
             "tau": {"values": [0.02, 0.05, 0.1, 0.2]},
             # Effective batch (real batch x grad accum): the per-forward batch
             # is fixed by MAX_REAL_BATCH, so memory use does not depend on this
@@ -373,7 +376,6 @@ def run_sweep(args) -> dict:
 
     return {
         "lr": best_run.config["lr"],
-        "unfreeze_layers": best_run.config["unfreeze_layers"],
         "tau": best_run.config["tau"],
         "effective_batch": best_run.config["effective_batch"],
     }
@@ -393,7 +395,6 @@ def main():
         # No search: use the CLI hyperparameters directly
         best_hparams = {
             "lr": args.lr,
-            "unfreeze_layers": args.unfreeze_layers,
             "tau": args.tau,
             "effective_batch": args.effective_batch,
         }
@@ -401,9 +402,13 @@ def main():
         # Hyperparameter search on SPair small before the actual training
         best_hparams = run_sweep(args)
 
-    # Actual training on SPair large with the selected hyperparameters
+    # Actual training on SPair large. unfreeze_layers e' fisso da CLI per
+    # tutta la pipeline (il suo ottimo dipende dalla taglia del dataset,
+    # quindi non viene cercato su small): per confrontare valori diversi si
+    # rilancia lo script con un altro --unfreeze-layers
     config = {
         **best_hparams,
+        "unfreeze_layers": args.unfreeze_layers,
         "cosine_decay": args.cosine_decay,
         "max_epochs": args.max_epochs,
         "patience": args.patience,
@@ -420,23 +425,24 @@ def main():
 
     wandb.init(
         project=args.wandb_project,
-        name=f"{args.model}-finetune",
+        name=f"{args.model}-finetune-unfreeze{args.unfreeze_layers}",
         config=config,
     )
     wandb.define_metric("val/pck_0.10", summary="max")
 
-    save_path = PROJECT_ROOT / "checkpoints" / "finetune" / f"{args.model.lower()}_best.pth"
+    # Un checkpoint per valore di unfreeze: lanci diversi non si sovrascrivono
+    save_path = PROJECT_ROOT / "checkpoints" / "finetune" / f"{args.model.lower()}_unfreeze{args.unfreeze_layers}_best.pth"
     best_pck = run_training(
         args,
         lr=best_hparams["lr"],
-        unfreeze_layers=best_hparams["unfreeze_layers"],
+        unfreeze_layers=args.unfreeze_layers,
         tau=best_hparams["tau"],
         effective_batch=best_hparams["effective_batch"],
         dataset_size='large',
         save_path=save_path,
     )
 
-    print(f"Training complete. Best val PCK@0.10: {best_pck:.2f}")
+    print(f"Training complete. Best val PCK@0.10: {best_pck:.2f} (checkpoint: {save_path.name})")
     wandb.finish()
 
 
