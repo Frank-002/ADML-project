@@ -1,5 +1,6 @@
 import argparse
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -48,6 +49,7 @@ def parse_args():
     common.add_argument("--effective-batch", type=int, default=32, help="effective training batch, reached via gradient accumulation (validation always uses 1)")
     common.add_argument("--real-batch", type=int, default=None, help="per-forward batch size; defaults to MAX_REAL_BATCH for the model")
     common.add_argument("--no-amp", dest="amp", action="store_false", help="disable bf16 mixed precision and train in fp32 (default: amp on, validation always fp32)")
+    common.add_argument("--compile", action="store_true", help="torch.compile the backbone forward (~10-30%% faster steps; needs Triton, on Windows: pip install triton-windows)")
     common.add_argument("--weight-decay", type=float, default=0.01)
     common.add_argument("--max-grad-norm", type=float, default=1.0)
     common.add_argument("--num-workers", type=int, default=4, help="dataloader workers; raise it if GPU utilization is spiky, lower it if system RAM fills up (train+val keep 2x this many worker processes alive)")
@@ -86,6 +88,21 @@ def get_backbone(model, model_name) -> torch.nn.Module:
     if model_name == "SAM":
         return model.model.model  # SamPredictor -> Sam
     return model.model
+
+
+def compile_backbone(backbone, model_name) -> None:
+    """
+    torch.compile del percorso pesante del forward, in-place: niente wrapper
+    OptimizedModule sul modulo, cosi' le chiavi dello state_dict (e quindi i
+    checkpoint letti da eval.py) restano identiche.
+    """
+    if model_name in ("DINOV2", "DINOV3"):
+        # I wrapper chiamano forward_features, non forward: si compila il metodo
+        backbone.forward_features = torch.compile(backbone.forward_features)
+    elif model_name == "SAM":
+        backbone.image_encoder.compile()
+    else:
+        raise NotImplementedError
 
 
 def unfreeze_last_layers(model, model_name, num_layers) -> list:
@@ -199,6 +216,10 @@ def run_training(args, *, lr, unfreeze_layers, tau, effective_batch, dataset_siz
     n_trainable = sum(p.numel() for p in trainable_params)
     print(f"{args.model}: last {unfreeze_layers} layers unfrozen -> {n_trainable / 1e6:.1f}M trainable parameters")
 
+    if args.compile:
+        compile_backbone(backbone, args.model)
+        print("torch.compile enabled: the first batches pay the compilation warmup")
+
     # Batch effettivo disaccoppiato dalla memoria: il forward usa il batch
     # reale massimo sostenibile dalla GPU e l'accumulo copre la differenza,
     # cosi' run con lo stesso effective_batch fanno gli stessi update per epoca
@@ -209,7 +230,8 @@ def run_training(args, *, lr, unfreeze_layers, tau, effective_batch, dataset_siz
 
     train_dataloader, val_dataloader = build_dataloaders(preprocess, dataset_size, args.num_workers, batch_size)
 
-    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=args.weight_decay)
+    # fused=True esegue l'update di AdamW in un kernel CUDA unico
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=args.weight_decay, fused=(device.type == "cuda"))
 
     # Cosine decay over optimizer steps (scheduler.step() is called by
     # train_one_epoch after every optimizer.step()). T_max is defined on the
@@ -360,6 +382,13 @@ def run_sweep(args) -> dict:
 def main():
     args = parse_args()
 
+    # La memory_efficient_attention di xformers non traccia sotto torch.compile
+    # (bug di device propagation nel suo backward): disabilitandola, DinoV2
+    # ripiega su F.scaled_dot_product_attention, equivalente per memoria e
+    # velocita'. Va fatto prima che torch.hub importi i moduli dinov2.
+    if args.compile:
+        os.environ["XFORMERS_DISABLED"] = "1"
+
     if args.skip_sweep:
         # No search: use the CLI hyperparameters directly
         best_hparams = {
@@ -380,6 +409,7 @@ def main():
         "patience": args.patience,
         "weight_decay": args.weight_decay,
         "amp": args.amp,
+        "compile": args.compile,
         "dataset_size": "large",
     }
 
