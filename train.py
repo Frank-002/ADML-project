@@ -279,6 +279,9 @@ def run_training(args, *, lr, unfreeze_layers, cosine_decay, batch_size, dataset
 def sweep_entry(args):
     """Single sweep run: hyperparameters come from wandb.config."""
     with wandb.init():
+        # Summary = max storico invece dell'ultimo valore loggato: bayes e
+        # best_run() confrontano le run sul best, non sull'epoca di early stop
+        wandb.define_metric("val/pck_0.10", summary="max")
         config = wandb.config
         run_training(
             args,
@@ -304,7 +307,7 @@ def run_sweep(args) -> dict:
             "lr": {"distribution": "log_uniform_values", "min": 1e-6, "max": 3e-4},
             "unfreeze_layers": {"values": [1, 2, 3, 4, 5]},
             "cosine_decay": {"values": [0.0, 0.01, 0.1]},
-            "batch_size": {"values": [2, 4, 8, 16, 32]},
+            "batch_size": {"values": [4, 8, 16, 32, 64]},
         },
         # Hyperband pruning: at epochs 2, 6, 18 (min_iter * eta^k) runs whose
         # val/pck_0.10 is in the bottom tier vs their peers get terminated
@@ -369,6 +372,7 @@ def main():
         name=f"{args.model}-finetune",
         config=config,
     )
+    wandb.define_metric("val/pck_0.10", summary="max")
 
     save_path = PROJECT_ROOT / "checkpoints" / "finetune" / f"{args.model.lower()}_best.pth"
     best_pck = run_training(
