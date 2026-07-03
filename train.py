@@ -2,7 +2,7 @@ import argparse
 import math
 import sys
 from pathlib import Path
-
+import psutil
 import torch
 import wandb
 from torch.utils.data import DataLoader
@@ -21,6 +21,12 @@ from data.SPairDataset import SPairDataset
 from utils.evaluator import evaluate_one_epoch
 from utils.trainer import train_one_epoch
 
+# Largest per-forward batch that fits in ~12 GB of VRAM in fp32, sized for the
+# highest unfreeze setting of the sweep; doubled when --amp halves the
+# activations, or overridden with --real-batch on other GPUs. The effective
+# batch is reached via gradient accumulation on top of it.
+MAX_REAL_BATCH = {"DINOV2": 8, "DINOV3": 4, "SAM": 2}
+
 
 def parse_args():
     common = argparse.ArgumentParser(add_help=False)
@@ -31,7 +37,7 @@ def parse_args():
     common.add_argument("--sweep-id", type=str, default=None, help="id of an existing sweep to join")
     common.add_argument("--sweep-count", type=int, default=20, help="number of sweep runs")
 
-    # Hyperparameters: lr / unfreeze-layers / cosine-decay / batch-size are
+    # Hyperparameters: lr / unfreeze-layers / tau / effective-batch are
     # proposed by W&B during the sweep; the CLI values are used only with --skip-sweep
     common.add_argument("--max-epochs", type=int, default=20, help="maximum number of epochs (also defines the cosine T_max)")
     common.add_argument("--patience", type=int, default=3, help="early stopping: epochs without val PCK@0.10 improvement")
@@ -39,11 +45,12 @@ def parse_args():
     common.add_argument("--unfreeze-layers", type=int, default=2, help="blocks to unfreeze starting from the head")
     common.add_argument("--cosine-decay", type=float, default=0.01, help="final lr = lr * cosine_decay")
     common.add_argument("--tau", type=float, default=0.05, help="InfoNCE temperature")
-    common.add_argument("--batch-size", type=int, default=1, help="training batch size (validation always uses 1)")
-    common.add_argument("--grad-accum", type=int, default=8)
+    common.add_argument("--effective-batch", type=int, default=32, help="effective training batch, reached via gradient accumulation (validation always uses 1)")
+    common.add_argument("--real-batch", type=int, default=None, help="per-forward batch size; defaults to MAX_REAL_BATCH for the model")
+    common.add_argument("--no-amp", dest="amp", action="store_false", help="disable bf16 mixed precision and train in fp32 (default: amp on, validation always fp32)")
     common.add_argument("--weight-decay", type=float, default=0.01)
     common.add_argument("--max-grad-norm", type=float, default=1.0)
-    common.add_argument("--num-workers", type=int, default=4, help="dataloader workers; raise it if GPU utilization is spiky")
+    common.add_argument("--num-workers", type=int, default=psutil.cpu_count(logical=False), help="dataloader workers; raise it if GPU utilization is spiky")
     common.add_argument("--wandb-project", type=str, default="ADML-project")
 
     parser = argparse.ArgumentParser()
@@ -177,7 +184,7 @@ def build_dataloaders(preprocess, dataset_size, num_workers, batch_size):
     return train_dataloader, val_dataloader
 
 
-def run_training(args, *, lr, unfreeze_layers, cosine_decay, batch_size, dataset_size, save_path=None) -> float:
+def run_training(args, *, lr, unfreeze_layers, tau, effective_batch, dataset_size, save_path=None) -> float:
     """
     Fine-tune the model with validation at the end of each epoch.
 
@@ -192,6 +199,14 @@ def run_training(args, *, lr, unfreeze_layers, cosine_decay, batch_size, dataset
     n_trainable = sum(p.numel() for p in trainable_params)
     print(f"{args.model}: last {unfreeze_layers} layers unfrozen -> {n_trainable / 1e6:.1f}M trainable parameters")
 
+    # Batch effettivo disaccoppiato dalla memoria: il forward usa il batch
+    # reale massimo sostenibile dalla GPU e l'accumulo copre la differenza,
+    # cosi' run con lo stesso effective_batch fanno gli stessi update per epoca
+    max_real_batch = args.real_batch or MAX_REAL_BATCH[args.model] * (2 if args.amp else 1)
+    batch_size = min(effective_batch, max_real_batch)
+    grad_accum = math.ceil(effective_batch / batch_size)
+    print(f"Effective batch {effective_batch} = {batch_size} per forward x {grad_accum} accumulation steps")
+
     train_dataloader, val_dataloader = build_dataloaders(preprocess, dataset_size, args.num_workers, batch_size)
 
     optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=args.weight_decay)
@@ -199,11 +214,11 @@ def run_training(args, *, lr, unfreeze_layers, cosine_decay, batch_size, dataset
     # Cosine decay over optimizer steps (scheduler.step() is called by
     # train_one_epoch after every optimizer.step()). T_max is defined on the
     # maximum number of epochs: with early stopping the cosine stays partial
-    steps_per_epoch = math.ceil(len(train_dataloader) / args.grad_accum)
+    steps_per_epoch = math.ceil(len(train_dataloader) / grad_accum)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=args.max_epochs * steps_per_epoch,
-        eta_min=lr * cosine_decay,
+        eta_min=lr * args.cosine_decay,
     )
 
     best_pck = 0.0
@@ -216,10 +231,11 @@ def run_training(args, *, lr, unfreeze_layers, cosine_decay, batch_size, dataset
             model=model,
             dataloader=train_dataloader,
             optimizer=optimizer,
-            loss_kwargs={"tau": args.tau},
+            loss_kwargs={"tau": tau},
             scheduler=scheduler,
-            grad_accum_steps=args.grad_accum,
+            grad_accum_steps=grad_accum,
             max_grad_norm=args.max_grad_norm,
+            amp=args.amp,
             epoch=epoch,
             log_wandb=True,
         )
@@ -257,8 +273,9 @@ def run_training(args, *, lr, unfreeze_layers, cosine_decay, batch_size, dataset
                     "config": {
                         "lr": lr,
                         "unfreeze_layers": unfreeze_layers,
-                        "cosine_decay": cosine_decay,
-                        "tau": args.tau,
+                        "tau": tau,
+                        "effective_batch": effective_batch,
+                        "cosine_decay": args.cosine_decay,
                     },
                     "state_dict": backbone.state_dict(),
                 }, save_path)
@@ -287,8 +304,8 @@ def sweep_entry(args):
             args,
             lr=config.lr,
             unfreeze_layers=config.unfreeze_layers,
-            cosine_decay=config.cosine_decay,
-            batch_size=config.batch_size,
+            tau=config.tau,
+            effective_batch=config.effective_batch,
             dataset_size='small',  # hyperparameter search on SPair small
         )
 
@@ -304,10 +321,14 @@ def run_sweep(args) -> dict:
         "method": "bayes",
         "metric": {"name": "val/pck_0.10", "goal": "maximize"},
         "parameters": {
-            "lr": {"distribution": "log_uniform_values", "min": 1e-6, "max": 3e-4},
+            # lr cap at 1e-4: above that a fine-tune wrecks the pretrained
+            # features in a few epochs and the run just burns sweep budget
+            "lr": {"distribution": "log_uniform_values", "min": 1e-6, "max": 1e-4},
             "unfreeze_layers": {"values": [1, 2, 3, 4, 5]},
-            "cosine_decay": {"values": [0.0, 0.01, 0.1]},
-            "batch_size": {"values": [4, 8, 16, 32, 64]},
+            "tau": {"values": [0.02, 0.05, 0.1, 0.2]},
+            # Effective batch (real batch x grad accum): the per-forward batch
+            # is fixed by MAX_REAL_BATCH, so memory use does not depend on this
+            "effective_batch": {"values": [16, 32, 64, 128]},
         },
         # Hyperband pruning: at epochs 2, 6, 18 (min_iter * eta^k) runs whose
         # val/pck_0.10 is in the bottom tier vs their peers get terminated
@@ -331,8 +352,8 @@ def run_sweep(args) -> dict:
     return {
         "lr": best_run.config["lr"],
         "unfreeze_layers": best_run.config["unfreeze_layers"],
-        "cosine_decay": best_run.config["cosine_decay"],
-        "batch_size": best_run.config["batch_size"],
+        "tau": best_run.config["tau"],
+        "effective_batch": best_run.config["effective_batch"],
     }
 
 
@@ -344,8 +365,8 @@ def main():
         best_hparams = {
             "lr": args.lr,
             "unfreeze_layers": args.unfreeze_layers,
-            "cosine_decay": args.cosine_decay,
-            "batch_size": args.batch_size,
+            "tau": args.tau,
+            "effective_batch": args.effective_batch,
         }
     else:
         # Hyperparameter search on SPair small before the actual training
@@ -354,11 +375,11 @@ def main():
     # Actual training on SPair large with the selected hyperparameters
     config = {
         **best_hparams,
-        "tau": args.tau,
+        "cosine_decay": args.cosine_decay,
         "max_epochs": args.max_epochs,
         "patience": args.patience,
-        "grad_accum": args.grad_accum,
         "weight_decay": args.weight_decay,
+        "amp": args.amp,
         "dataset_size": "large",
     }
 
@@ -379,8 +400,8 @@ def main():
         args,
         lr=best_hparams["lr"],
         unfreeze_layers=best_hparams["unfreeze_layers"],
-        cosine_decay=best_hparams["cosine_decay"],
-        batch_size=best_hparams["batch_size"],
+        tau=best_hparams["tau"],
+        effective_batch=best_hparams["effective_batch"],
         dataset_size='large',
         save_path=save_path,
     )

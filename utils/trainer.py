@@ -16,6 +16,7 @@ def train_one_epoch(
     scheduler: Any | None = None,
     grad_accum_steps: int = 1,
     max_grad_norm: float | None = None,
+    amp: bool = False,
     epoch: int | None = None,
     log_wandb: bool = False,
     log_every: int = 50,
@@ -31,6 +32,8 @@ def train_one_epoch(
     scheduler: se presente, step() dopo ogni optimizer.step()
     grad_accum_steps: accumula i gradienti per N batch prima dello step
     max_grad_norm: se presente, clip della norma del gradiente
+    amp: se True, forward e loss girano in bf16 autocast (pesi, gradienti e
+         optimizer restano fp32; niente GradScaler, bf16 ha il range di fp32)
 
     return: loss media sull'epoca
     """
@@ -47,21 +50,23 @@ def train_one_epoch(
         src_img = batch["src_img"]
         trg_img = batch["trg_img"]
 
-        src_featuremap = model.forward(src_img)
-        trg_featuremap = model.forward(trg_img)
+        # Il backward resta fuori dall'autocast, come da ricetta PyTorch
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+            src_featuremap = model.forward(src_img)
+            trg_featuremap = model.forward(trg_img)
 
-        loss = loss_fn(
-            src_feat=src_featuremap,
-            trg_feat=trg_featuremap,
-            src_kps=batch["src_kps"],
-            trg_kps=batch["trg_kps"],
-            src_image_size_pad=tuple(src_img.shape[-2:]),
-            trg_image_size_pad=tuple(trg_img.shape[-2:]),
-            src_nopad_size=batch.get("src_nopad_size"),
-            trg_nopad_size=batch.get("trg_nopad_size"),
-            kps_valid_mask=batch.get("kps_valid_mask"),
-            **loss_kwargs,
-        )
+            loss = loss_fn(
+                src_feat=src_featuremap,
+                trg_feat=trg_featuremap,
+                src_kps=batch["src_kps"],
+                trg_kps=batch["trg_kps"],
+                src_image_size_pad=tuple(src_img.shape[-2:]),
+                trg_image_size_pad=tuple(trg_img.shape[-2:]),
+                src_nopad_size=batch.get("src_nopad_size"),
+                trg_nopad_size=batch.get("trg_nopad_size"),
+                kps_valid_mask=batch.get("kps_valid_mask"),
+                **loss_kwargs,
+            )
 
         (loss / grad_accum_steps).backward()
 
