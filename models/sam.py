@@ -1,10 +1,12 @@
 from pathlib import Path
 
 import torch
-from segment_anything import sam_model_registry, SamPredictor
+from segment_anything import sam_model_registry
+
+from models.Backbone import Backbone
 
 
-class SAM():
+class SAM(Backbone):
     def __init__(
             self,
             *,
@@ -12,28 +14,22 @@ class SAM():
             checkpoint: Path,
             trainable: bool = False
     ):
-        self.device = device
-        self.trainable = trainable
         model = sam_model_registry["vit_b"](checkpoint=checkpoint)
-        if trainable:
-            model.to(self.device).train()
-        else:
-            model.to(self.device).eval()
-
-        self.model = SamPredictor(model)
-
-        self.patch_size = int(self.model.model.image_encoder.patch_embed.proj.kernel_size[0])
+        patch_size = int(model.image_encoder.patch_embed.proj.kernel_size[0])
+        super().__init__(
+            model,
+            device,
+            patch_size,
+            trainable
+        )
 
     def forward(
             self,
             image: torch.Tensor,
     ) -> torch.Tensor:
-        if self.trainable:
-            # Replica SamPredictor.set_torch_image (preprocess + image_encoder)
-            # senza il suo @torch.no_grad(), che bloccherebbe il fine-tuning
-            image = self.model.model.preprocess(image.to(self.device))
-            features = self.model.model.image_encoder(image)
-        else:
-            self.model.set_torch_image(image.to(self.device), (1024, 1024))
-            features = self.model.get_image_embedding()
-        return features
+        # L'input arriva gia' normalizzato e paddato a 1024 da PreProcess
+        # (apply_norm=True: le pixel_mean/std di Sam.preprocess sono le
+        # statistiche ImageNet in scala 0-255), quindi Sam.preprocess non va
+        # richiamato: l'immagine entra diretta nell'image_encoder
+        image = image.to(self.device)
+        return self.model.image_encoder(image)

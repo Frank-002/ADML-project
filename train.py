@@ -64,8 +64,8 @@ def parse_args():
 
 
 def get_backbone(model, model_name) -> torch.nn.Module:
-    if model_name == "SAM":
-        return model.model.model  # SamPredictor -> Sam
+    # Tutti i wrapper espongono il backbone in .model (per SAM e' il modulo
+    # Sam: le chiavi image_encoder.* dello state_dict restano invariate)
     return model.model
 
 
