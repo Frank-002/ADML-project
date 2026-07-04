@@ -7,6 +7,21 @@ from models.sam import SAM
 from utils.preprocess import PreProcess
 
 
+def compile_backbone(backbone, model_name) -> None:
+    """
+    torch.compile del percorso pesante del forward, in-place: niente wrapper
+    OptimizedModule sul modulo, cosi' le chiavi dello state_dict (e quindi i
+    checkpoint letti da eval.py) restano identiche.
+    """
+    if model_name in ("DINOV2", "DINOV3"):
+        # I wrapper chiamano forward_features, non forward: si compila il metodo
+        backbone.forward_features = torch.compile(backbone.forward_features)
+    elif model_name == "SAM":
+        backbone.image_encoder.compile()
+    else:
+        raise NotImplementedError
+
+
 def build_model_and_preprocess(
         model_name: str,
         checkpoint: Path,
@@ -15,7 +30,7 @@ def build_model_and_preprocess(
 ):
     match model_name:
         case "DINOV2":
-            model = DinoBackbone(model_name=model_name, device=device, trainable=trainable)
+            model = DinoBackbone(model_name=model_name, device=device, checkpoint=checkpoint, trainable=trainable)
             preprocess = PreProcess(long_side_length=518, apply_norm=True)
         case "SAM":
             model = SAM(device=device, checkpoint=checkpoint, trainable=trainable)

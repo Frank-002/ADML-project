@@ -19,6 +19,12 @@ class DinoBackbone(Backbone):
         match model_name:
             case "DINOV2":
                 model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
+                if checkpoint is not None:
+                    # Checkpoint fine-tunati salvati da train.py: le chiavi di
+                    # state_dict sono quelle del modello hub (train.py compila
+                    # in-place proprio per non alterarle)
+                    state = torch.load(checkpoint, map_location="cpu")
+                    model.load_state_dict(state["state_dict"])
             case "DINOV3":
                 # I pesi base di DinoV3 sono gated: vanno scaricati a parte
                 # e passati via checkpoint
@@ -27,10 +33,11 @@ class DinoBackbone(Backbone):
                     'dinov3_vitb16',
                     source='local',
                     weights=str(checkpoint))
+                # TODO: per DINOV3 checkpoint indica i pesi base, non un
+                #  checkpoint di train.py: il fine-tunato richiede un
+                #  argomento separato
             case _:
                 raise NotImplementedError(model_name)
-        # TODO: caricamento dei checkpoint fine-tunati salvati da train.py
-        #  ({"state_dict": ...}): andra' qui, comune a DINOV2 e DINOV3
         super().__init__(
             model,
             device,

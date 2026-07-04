@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import wandb
-from utils.model_builder import build_model_and_preprocess
+from utils.model_builder import build_model_and_preprocess, compile_backbone
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -67,21 +67,6 @@ def get_backbone(model, model_name) -> torch.nn.Module:
     # Tutti i wrapper espongono il backbone in .model (per SAM e' il modulo
     # Sam: le chiavi image_encoder.* dello state_dict restano invariate)
     return model.model
-
-
-def compile_backbone(backbone, model_name) -> None:
-    """
-    torch.compile del percorso pesante del forward, in-place: niente wrapper
-    OptimizedModule sul modulo, cosi' le chiavi dello state_dict (e quindi i
-    checkpoint letti da eval.py) restano identiche.
-    """
-    if model_name in ("DINOV2", "DINOV3"):
-        # I wrapper chiamano forward_features, non forward: si compila il metodo
-        backbone.forward_features = torch.compile(backbone.forward_features)
-    elif model_name == "SAM":
-        backbone.image_encoder.compile()
-    else:
-        raise NotImplementedError
 
 
 def unfreeze_last_layers(model, model_name, num_layers) -> list:
@@ -188,7 +173,7 @@ def run_training(args, *, lr, unfreeze_layers, tau, effective_batch, dataset_siz
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model, preprocess = build_model_and_preprocess(args.model, args.checkpoint, device)
+    model, preprocess = build_model_and_preprocess(args.model, args.checkpoint, device, True)
     backbone = get_backbone(model, args.model)
 
     trainable_params = unfreeze_last_layers(model, args.model, unfreeze_layers)
