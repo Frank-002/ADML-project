@@ -6,8 +6,6 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from models.dinov3 import DinoV3
-from models.sam import SAM
 from utils import preprocess
 from utils.featuremap import dense_correspondence
 from utils.model_builder import build_model_and_preprocess
@@ -19,7 +17,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from data.SPairDataset import SPairDataset
-from models.dinov2 import DinoV2
 
 def parse_args():
     parser = argparse.ArgumentParser()

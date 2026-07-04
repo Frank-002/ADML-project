@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 from segment_anything import sam_model_registry
 
-from models.Backbone import Backbone
+from models.backbone import Backbone
 
 
 class SAM(Backbone):
