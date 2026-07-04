@@ -5,14 +5,12 @@ import sys
 from pathlib import Path
 
 import torch
-import wandb
+import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from models.dinov2 import DinoV2
-from models.dinov3 import DinoV3
-from models.sam import SAM
-from utils.preprocess import PreProcess
+import wandb
+from utils.model_builder import build_model_and_preprocess
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -63,25 +61,6 @@ def parse_args():
     model.add_parser("SAM", parents=[common])
 
     return parser.parse_args()
-
-
-def build_model_and_preprocess(model_name, checkpoint, device):
-    # In the sweep each run must start from a fresh model, so the
-    # construction lives in a function rather than in main
-    match (model_name):
-        case "DINOV2":
-            model = DinoV2(device=device, trainable=True)
-            preprocess = PreProcess(long_side_length=518, apply_norm=True)
-        case "SAM":
-            model = SAM(device=device, checkpoint=checkpoint, trainable=True)
-            preprocess = PreProcess(long_side_length=1024, apply_norm=False)
-        case "DINOV3":
-            model = DinoV3(device=device, checkpoint=checkpoint, trainable=True)
-            preprocess = PreProcess(long_side_length=768, apply_norm=True)
-        case _:
-            raise NotImplementedError
-
-    return model, preprocess
 
 
 def get_backbone(model, model_name) -> torch.nn.Module:
@@ -342,31 +321,23 @@ def run_sweep(args) -> dict:
 
     return: hyperparameters of the best run (highest val/pck_0.10)
     """
-    sweep_config = {
-        "name": f"{args.model}-finetune",
-        "method": "bayes",
-        "metric": {"name": "val/pck_0.10", "goal": "maximize"},
-        "parameters": {
-            # lr cap at 1e-4: above that a fine-tune wrecks the pretrained
-            # features in a few epochs and the run just burns sweep budget
-            "lr": {"distribution": "log_uniform_values", "min": 1e-6, "max": 1e-4},
-            "tau": {"values": [0.02, 0.05, 0.1, 0.2]},
-            # Effective batch (real batch x grad accum): the per-forward batch
-            # is fixed by MAX_REAL_BATCH, so memory use does not depend on this
-            "effective_batch": {"values": [16, 32, 64, 128]},
-        },
-        # Hyperband pruning: at epochs 2, 6, 18 (min_iter * eta^k) runs whose
-        # val/pck_0.10 is in the bottom tier vs their peers get terminated
-        "early_terminate": {
-            "type": "hyperband",
-            "min_iter": 2,
-            "eta": 3,
-        },
-    }
+    # Search space e pruning vivono in sweep_config.yaml; solo il nome dello
+    # sweep dipende dal modello scelto da CLI
+    with open(PROJECT_ROOT / "sweep_config.yaml", encoding="utf-8") as f:
+        sweep_config = yaml.safe_load(f)
+    sweep_config["name"] = f"{args.model}-finetune"
 
     print(f"Launching W&B sweep for {args.model}: {args.sweep_count} runs on SPair small")
     sweep_id = args.sweep_id or wandb.sweep(sweep_config, project=args.wandb_project)
     wandb.agent(sweep_id, function=lambda: sweep_entry(args), count=args.sweep_count, project=args.wandb_project)
+
+    # L'agent passa run id e config a wandb.init tramite os.environ
+    # (pyagent._run_job); la sua pulizia gira nel thread della run e se
+    # hyperband uccide l'ultima run perde la corsa col wandb.init del
+    # training finale, che riprenderebbe la run prunata (il server la ha
+    # marcata "stop requested" e ucciderebbe anche il training finale)
+    for var in (wandb.env.RUN_ID, wandb.env.SWEEP_ID, wandb.env.SWEEP_PARAM_PATH):
+        os.environ.pop(var, None)
 
     # Fetch the best run of the finished sweep (ranked by the sweep metric)
     api = wandb.Api()

@@ -10,6 +10,7 @@ from models.dinov3 import DinoV3
 from models.sam import SAM
 from utils import preprocess
 from utils.featuremap import dense_correspondence
+from utils.model_builder import build_model_and_preprocess
 from utils.preprocess import PreProcess
 from utils.results import compute_and_print_pck
 
@@ -46,19 +47,12 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    match(args.model):
-        case "DINOV2":
-            model = DinoV2(device=device)
-            preprocess = PreProcess(long_side_length=518, apply_norm=True)
-        case "SAM":
-            model = SAM(device=device, checkpoint=args.checkpoint)
-            preprocess = PreProcess(long_side_length=1024, apply_norm=False)
-        case "DINOV3":
-            model = DinoV3(device=device, checkpoint=args.checkpoint)
-            preprocess = PreProcess(long_side_length=768, apply_norm=True)
-        case _:
-            raise NotImplementedError
-
+    model, preprocess = build_model_and_preprocess(
+        model_name=args.model,
+        checkpoint=args.checkpoint,
+        device=device,
+        trainable=False
+    )
 
     test_dataset = SPairDataset(pair_ann_path, layout_path, image_path, dataset_size, pck_alpha, datatype='test', preprocess=preprocess)
     test_dataloader = DataLoader(test_dataset, num_workers=1, batch_size=1)
