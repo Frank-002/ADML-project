@@ -35,6 +35,7 @@ def parse_args():
     common.add_argument("--skip-sweep", action="store_true", help="skip the hyperparameter search and use the CLI hyperparameters directly")
     common.add_argument("--sweep-id", type=str, default=None, help="id of an existing sweep to join")
     common.add_argument("--sweep-count", type=int, default=12, help="number of sweep runs")
+    common.add_argument("--sweep-name", type=str, default=None, help="name of the W&B sweep (default: <MODEL>-finetune; ignored with --sweep-id, the name is fixed at sweep creation)")
 
     # Hyperparameters: lr / tau / effective-batch are proposed by W&B during
     # the sweep; the CLI values are used only with --skip-sweep
@@ -306,23 +307,23 @@ def run_sweep(args) -> dict:
 
     return: hyperparameters of the best run (highest val/pck_0.10)
     """
-    # Search space e pruning vivono in sweep_config.yaml; solo il nome dello
-    # sweep dipende dal modello scelto da CLI
+    # Search space e pruning vivono in sweep_config.yaml; il nome dello sweep
+    # arriva da --sweep-name, con fallback sul modello scelto da CLI
     with open(PROJECT_ROOT / "sweep_config.yaml", encoding="utf-8") as f:
         sweep_config = yaml.safe_load(f)
-    sweep_config["name"] = f"{args.model}-finetune"
+    sweep_config["name"] = args.sweep_name or f"{args.model}-finetune"
 
     print(f"Launching W&B sweep for {args.model}: {args.sweep_count} runs on SPair small")
     sweep_id = args.sweep_id or wandb.sweep(sweep_config, project=args.wandb_project)
     wandb.agent(sweep_id, function=lambda: sweep_entry(args), count=args.sweep_count, project=args.wandb_project)
 
-    # L'agent passa run id e config a wandb.init tramite os.environ
-    # (pyagent._run_job); la sua pulizia gira nel thread della run e se
-    # hyperband uccide l'ultima run perde la corsa col wandb.init del
-    # training finale, che riprenderebbe la run prunata (il server la ha
-    # marcata "stop requested" e ucciderebbe anche il training finale)
-    for var in (wandb.env.RUN_ID, wandb.env.SWEEP_ID, wandb.env.SWEEP_PARAM_PATH):
-        os.environ.pop(var, None)
+    # L'agent fa wandb.teardown() prima di ogni run ma non dopo l'ultima: il
+    # singleton wandb resta con sweep_id/run_id dell'ultima run dello sweep
+    # (a sessione avviata le env var, che pyagent ripulisce, sono ignorate) e
+    # il wandb.init del training finale riprenderebbe quella run invece di
+    # crearne una nuova: se hyperband la ha marcata "stop requested" il
+    # server ucciderebbe anche il training finale via KeyboardInterrupt
+    wandb.teardown()
 
     # Fetch the best run of the finished sweep (ranked by the sweep metric)
     api = wandb.Api()

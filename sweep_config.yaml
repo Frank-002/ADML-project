@@ -1,5 +1,6 @@
 # W&B sweep search space (hyperparameter search on SPair small).
-# Standard wandb sweep format; the sweep name is set by train.py from --model.
+# Standard wandb sweep format; the sweep name is set by train.py from
+# --sweep-name (falling back to <MODEL>-finetune).
 method: bayes
 metric:
   name: val/pck_0.10
