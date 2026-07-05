@@ -348,6 +348,8 @@ def main():
     if args.compile:
         os.environ["XFORMERS_DISABLED"] = "1"
 
+    torch.set_float32_matmul_precision('high')
+
     if args.skip_sweep:
         # No search: use the CLI hyperparameters directly
         best_hparams = {
