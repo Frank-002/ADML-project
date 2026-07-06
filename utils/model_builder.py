@@ -7,7 +7,7 @@ from models.sam import SAM
 from utils.preprocess import PreProcess
 
 
-def compile_backbone(backbone, model_name) -> None:
+def compile_backbone(backbone, model_name, mode=None) -> None:
     """
     torch.compile del percorso pesante del forward, in-place: niente wrapper
     OptimizedModule sul modulo, cosi' le chiavi dello state_dict (e quindi i
@@ -15,7 +15,7 @@ def compile_backbone(backbone, model_name) -> None:
     """
     if model_name in ("DINOV2", "DINOV3"):
         # I wrapper chiamano forward_features, non forward: si compila il metodo
-        backbone.forward_features = torch.compile(backbone.forward_features)
+        backbone.forward_features = torch.compile(backbone.forward_features, mode=mode)
     elif model_name == "SAM":
         backbone.image_encoder.compile()
     else:

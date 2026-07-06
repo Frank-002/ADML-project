@@ -26,16 +26,26 @@ class DinoBackbone(Backbone):
                     state = torch.load(checkpoint, map_location="cpu")
                     model.load_state_dict(state["state_dict"])
             case "DINOV3":
-                # I pesi base di DinoV3 sono gated: vanno scaricati a parte
-                # e passati via checkpoint
-                model = torch.hub.load(
-                    str(PROJECT_ROOT / "dinov3-git"),
-                    'dinov3_vitb16',
-                    source='local',
-                    weights=str(checkpoint))
-                # TODO: per DINOV3 checkpoint indica i pesi base, non un
-                #  checkpoint di train.py: il fine-tunato richiede un
-                #  argomento separato
+                # checkpoint accetta sia i pesi base (gated, scaricati a
+                # parte) sia un checkpoint fine-tunato di train.py: i due
+                # formati si distinguono dalla chiave "state_dict"
+                state = torch.load(checkpoint, map_location="cpu")
+                if isinstance(state, dict) and "state_dict" in state:
+                    # Checkpoint di train.py: contiene lo state_dict completo
+                    # del backbone (chiavi del modello hub), i pesi base non
+                    # servono
+                    model = torch.hub.load(
+                        str(PROJECT_ROOT / "dinov3-git"),
+                        'dinov3_vitb16',
+                        source='local',
+                        pretrained=False)
+                    model.load_state_dict(state["state_dict"])
+                else:
+                    model = torch.hub.load(
+                        str(PROJECT_ROOT / "dinov3-git"),
+                        'dinov3_vitb16',
+                        source='local',
+                        weights=str(checkpoint))
             case _:
                 raise NotImplementedError(model_name)
         super().__init__(

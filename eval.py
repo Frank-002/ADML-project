@@ -30,7 +30,7 @@ def parse_args():
     dinov2.add_argument("--checkpoint", type=Path, required=False, help="path to a fine-tuned checkpoint saved by train.py (default: pretrained hub weights)")
 
     dinov3 = model.add_parser("DINOV3", parents=[common])
-    dinov3.add_argument("--checkpoint", type=Path, required=False, help="path to checkpoint")
+    dinov3.add_argument("--checkpoint", type=Path, required=False, help="path to the base DinoV3 weights (gated, downloaded separately) or to a fine-tuned checkpoint saved by train.py (auto-detected)")
 
     sam = model.add_parser("SAM", parents=[common])
     sam.add_argument("--checkpoint", type=Path, required=False, help="path to checkpoint")
@@ -46,6 +46,8 @@ def main():
     # torch.hub importi i moduli dinov2.
     if args.compile:
         os.environ["XFORMERS_DISABLED"] = "1"
+
+    torch.set_float32_matmul_precision('high')
 
     pair_ann_path = PROJECT_ROOT / "dataset" / "SPair-71k" / "PairAnnotation"
     layout_path = PROJECT_ROOT / "dataset" / "SPair-71k" / "Layout"
@@ -65,7 +67,7 @@ def main():
     if args.compile:
         # Tutti i wrapper espongono il backbone in .model; le immagini sono
         # padded a un quadrato fisso, quindi la compilazione avviene una volta
-        compile_backbone(model.model, args.model)
+        compile_backbone(model.model, args.model, "reduce-overhead")  #max-autotune
         print("torch.compile enabled: the first batches pay the compilation warmup (--no-compile to disable)")
 
     test_dataset = SPairDataset(pair_ann_path, layout_path, image_path, dataset_size, pck_alpha, datatype='test', preprocess=preprocess)
