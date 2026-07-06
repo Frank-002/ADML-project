@@ -2,7 +2,7 @@
 
 Fine-tuning and benchmarking of vision foundation backbones (**DINOv2**, **DINOv3**, **SAM**) on **dense semantic correspondence** over the [SPair-71k](http://cvlab.postech.ac.kr/research/SPair-71k/) benchmark.
 
-> Solo project by **Anonymous** — Advanced Deep Machine Learning (ADML) course.
+> Solo project by **Francesco Pio Taronna** — Advanced Machine Learning (ADML) course.
 
 ## Overview
 

@@ -67,7 +67,7 @@ def main():
     if args.compile:
         # Tutti i wrapper espongono il backbone in .model; le immagini sono
         # padded a un quadrato fisso, quindi la compilazione avviene una volta
-        compile_backbone(model.model, args.model, "reduce-overhead")  #max-autotune
+        compile_backbone(model.model, args.model)
         print("torch.compile enabled: the first batches pay the compilation warmup (--no-compile to disable)")
 
     test_dataset = SPairDataset(pair_ann_path, layout_path, image_path, dataset_size, pck_alpha, datatype='test', preprocess=preprocess)
