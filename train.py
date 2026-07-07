@@ -412,6 +412,20 @@ def main():
     )
 
     print(f"Training complete. Best val PCK@0.10: {best_pck:.2f} (checkpoint: {save_path.name})")
+
+    # Versiono il best checkpoint come W&B Artifact: ogni lancio produce
+    # una nuova versione legata alla run (config + metriche), cosi' i .pth
+    # locali sovrascritti da lanci successivi restano recuperabili
+    if save_path.exists():
+        artifact = wandb.Artifact(
+            name=f"{args.model.lower()}-finetune-unfreeze{args.unfreeze_layers}",
+            type="model",
+            metadata={**config, "val_pck_0.10": best_pck},
+        )
+        artifact.add_file(str(save_path))
+        wandb.log_artifact(artifact)
+        print(f"Checkpoint uploaded to W&B as artifact '{artifact.name}'")
+
     wandb.finish()
 
 
