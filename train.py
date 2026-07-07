@@ -214,73 +214,77 @@ def run_training(args, *, lr, unfreeze_layers, tau, effective_batch, dataset_siz
     epochs_no_improve = 0
 
     epoch_bar = tqdm(range(args.max_epochs), desc=f"{args.model} epochs", unit="epoch")
-    for epoch in epoch_bar:
-        backbone.train()
-        avg_loss = train_one_epoch(
-            model=model,
-            dataloader=train_dataloader,
-            optimizer=optimizer,
-            loss_kwargs={"tau": tau},
-            scheduler=scheduler,
-            grad_accum_steps=grad_accum,
-            max_grad_norm=args.max_grad_norm,
-            amp=args.amp,
-            epoch=epoch,
-            log_wandb=True,
-        )
+    try:
+        for epoch in epoch_bar:
+            backbone.train()
+            avg_loss = train_one_epoch(
+                model=model,
+                dataloader=train_dataloader,
+                optimizer=optimizer,
+                loss_kwargs={"tau": tau},
+                scheduler=scheduler,
+                grad_accum_steps=grad_accum,
+                max_grad_norm=args.max_grad_norm,
+                amp=args.amp,
+                epoch=epoch,
+                log_wandb=True,
+            )
 
-        backbone.eval()
-        metrics = evaluate_one_epoch(
-            model=model,
-            dataloader=val_dataloader,
-            method_name=f"{args.model} (epoch {epoch})",
-            log_wandb=False,
-        )
+            backbone.eval()
+            metrics = evaluate_one_epoch(
+                model=model,
+                dataloader=val_dataloader,
+                method_name=f"{args.model} (epoch {epoch})",
+                log_wandb=False,
+            )
 
-        pck = {name: metrics["point"][name]["mean"] for name in ("0.05", "0.10", "0.20")}
+            pck = {name: metrics["point"][name]["mean"] for name in ("0.05", "0.10", "0.20")}
 
-        epoch_bar.set_postfix(loss=f"{avg_loss:.3f}", pck10=f"{pck['0.10']:.2f}")
+            epoch_bar.set_postfix(loss=f"{avg_loss:.3f}", pck10=f"{pck['0.10']:.2f}")
 
-        wandb.log({
-            "epoch": epoch,
-            "train/avg_loss": avg_loss,
-            "val/pck_0.05": pck["0.05"],
-            "val/pck_0.10": pck["0.10"],
-            "val/pck_0.20": pck["0.20"],
-        })
+            wandb.log({
+                "epoch": epoch,
+                "train/avg_loss": avg_loss,
+                "val/pck_0.05": pck["0.05"],
+                "val/pck_0.10": pck["0.10"],
+                "val/pck_0.20": pck["0.20"],
+            })
 
-        if pck["0.10"] > best_pck:
-            best_pck = pck["0.10"]
-            epochs_no_improve = 0
+            if pck["0.10"] > best_pck:
+                best_pck = pck["0.10"]
+                epochs_no_improve = 0
 
-            if save_path is not None:
-                save_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save({
-                    "model": args.model,
-                    "epoch": epoch,
-                    "val_pck_0.10": best_pck,
-                    "config": {
-                        "lr": lr,
-                        "unfreeze_layers": unfreeze_layers,
-                        "tau": tau,
-                        "effective_batch": effective_batch,
-                        "cosine_decay": args.cosine_decay,
-                    },
-                    "state_dict": backbone.state_dict(),
-                }, save_path)
-                print(f"New best (val PCK@0.10 = {best_pck:.2f}): checkpoint saved to {save_path}")
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= args.patience:
-                print(f"Early stopping at epoch {epoch}: val PCK@0.10 stuck at {best_pck:.2f} for {args.patience} epochs")
-                break
-
-    if wandb.run is not None:
-        # La summary di default e' l'ultimo wandb.log: best_run() e il ranking
-        # dello sweep leggono questa chiave, quindi la sovrascriviamo col best
-        wandb.run.summary["val/pck_0.10"] = best_pck
-        wandb.run.summary["best/val_pck_0.10"] = best_pck
-        wandb.run.summary["stopped_epoch"] = epoch
+                if save_path is not None:
+                    save_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save({
+                        "model": args.model,
+                        "epoch": epoch,
+                        "val_pck_0.10": best_pck,
+                        "config": {
+                            "lr": lr,
+                            "unfreeze_layers": unfreeze_layers,
+                            "tau": tau,
+                            "effective_batch": effective_batch,
+                            "cosine_decay": args.cosine_decay,
+                        },
+                        "state_dict": backbone.state_dict(),
+                    }, save_path)
+                    print(f"New best (val PCK@0.10 = {best_pck:.2f}): checkpoint saved to {save_path}")
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= args.patience:
+                    print(f"Early stopping at epoch {epoch}: val PCK@0.10 stuck at {best_pck:.2f} for {args.patience} epochs")
+                    break
+    finally:
+        if wandb.run is not None:
+            # La summary di default e' l'ultimo wandb.log: best_run() e il ranking
+            # dello sweep leggono questa chiave, quindi la sovrascriviamo col best
+            # (nel finally perche' hyperband termina le run potate con una
+            # KeyboardInterrupt dentro il loop: senza, quelle run resterebbero in
+            # summary con l'ultimo valore loggato, tipicamente il peggiore)
+            wandb.run.summary["val/pck_0.10"] = best_pck
+            wandb.run.summary["best/val_pck_0.10"] = best_pck
+            wandb.run.summary["stopped_epoch"] = epoch
 
     return best_pck
 
