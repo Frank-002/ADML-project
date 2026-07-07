@@ -1,0 +1,31 @@
+# W&B sweep search space for DINOV3, auto-selected by train.py when
+# launching `train.py DINOV3` (override with --sweep-config).
+# Standard wandb sweep format; the sweep name is set by train.py from
+# --sweep-name (falling back to <MODEL>-uf<N>).
+method: bayes
+metric:
+  name: val/pck_0.10
+  goal: maximize
+parameters:
+  # Constant for every run: SPair split the search runs on (the final
+  # training after the sweep always uses large)
+  dataset_size:
+    value: large
+  # lr cap at 3e-5: one epoch on large is ~5x the optimizer steps of
+  # small, higher lr overshoots the PCK peak before the first validation
+  lr:
+    distribution: log_uniform_values
+    min: 2.0e-6
+    max: 3.0e-5
+  tau:
+    values: [0.02, 0.05]
+  # Effective batch (real batch x grad accum): the per-forward batch
+  # is fixed by MAX_REAL_BATCH, so memory use does not depend on this
+  effective_batch:
+    values: [16, 32, 64]
+# Hyperband pruning: at epochs 2, 6, 18 (min_iter * eta^k) runs whose
+# val/pck_0.10 is in the bottom tier vs their peers get terminated
+early_terminate:
+  type: hyperband
+  min_iter: 2
+  eta: 3

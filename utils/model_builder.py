@@ -14,7 +14,6 @@ def compile_backbone(backbone, model_name, mode=None) -> None:
     checkpoint letti da eval.py) restano identiche.
     """
     if model_name in ("DINOV2", "DINOV3"):
-        # I wrapper chiamano forward_features, non forward: si compila il metodo
         backbone.forward_features = torch.compile(backbone.forward_features, mode=mode)
     elif model_name == "SAM":
         backbone.image_encoder.compile()
@@ -35,12 +34,12 @@ def build_model_and_preprocess(
         case "SAM":
             model = SAM(device=device, checkpoint=checkpoint, trainable=trainable)
             # apply_norm=True sostituisce Sam.preprocess (stesse statistiche,
-            # vedi models/sam.py); il pad avviene dopo la norm, come nella
+            # vedere models/sam.py); il pad avviene dopo la norm, come nella
             # pipeline SAM ufficiale
             preprocess = PreProcess(long_side_length=1024, apply_norm=True)
         case "DINOV3":
             model = DinoBackbone(model_name=model_name, device=device, checkpoint=checkpoint, trainable=trainable)
-            preprocess = PreProcess(long_side_length=512, apply_norm=True)
+            preprocess = PreProcess(long_side_length=768, apply_norm=True)
         case _:
             raise NotImplementedError
 

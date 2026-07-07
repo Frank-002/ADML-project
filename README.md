@@ -31,7 +31,7 @@ Evaluation on the SPair-71k **test split (large)**, reporting per-point PCK@α (
 | SAM ViT-B (pretrained) | TBD | TBD | TBD |
 | SAM ViT-B (fine-tuned) | TBD | TBD | TBD |
 
-> **Hyperparameter search.** All fine-tuning hyperparameters (learning rate, InfoNCE temperature τ, effective batch size) were found with a [Weights & Biases](https://wandb.ai) **Bayesian sweep** with Hyperband early termination, run on the SPair-71k *small* split before the final training on *large* (see [`sweep_config.yaml`](sweep_config.yaml)). Training curves, sweep results and full metrics are logged to the `ADML-project` W&B project.
+> **Hyperparameter search.** All fine-tuning hyperparameters (learning rate, InfoNCE temperature τ, effective batch size) were found with a [Weights & Biases](https://wandb.ai) **Bayesian sweep** with Hyperband early termination, run before the final training on *large*. The search space (and the SPair split it runs on) lives in a per-model config under [`sweep_configs/`](sweep_configs/). Training curves, sweep results and full metrics are logged to the `ADML-project` W&B project.
 
 ## Setup
 
@@ -105,7 +105,7 @@ python eval.py DINOV3 --checkpoint checkpoints/finetune/dinov3_unfreeze4_best.pt
 
 Training runs in two stages, driven by a single command:
 
-1. **Hyperparameter search** — a W&B Bayesian sweep (`--sweep-count` runs, default 12) on the SPair-71k *small* split, searching learning rate, τ and effective batch size, with Hyperband pruning of weak runs.
+1. **Hyperparameter search** — a W&B Bayesian sweep (`--sweep-count` runs, default 12) searching learning rate, τ and effective batch size, with Hyperband pruning of weak runs. The search space and the SPair split it runs on are read from `sweep_configs/<model>.yaml` (override with `--sweep-config`).
 2. **Final training** — on the SPair-71k *large* split with the best hyperparameters from the sweep. bf16 mixed precision, cosine LR decay, and early stopping on validation PCK@0.10.
 
 ```bash
@@ -132,9 +132,9 @@ The best checkpoint (by validation PCK@0.10) is saved to `checkpoints/finetune/<
 ## Project structure
 
 ```
-├── train.py             # two-stage training: W&B sweep (small) + fine-tuning (large)
+├── train.py             # two-stage training: W&B sweep + fine-tuning (large)
 ├── eval.py              # PCK evaluation on the SPair-71k test split
-├── sweep_config.yaml    # W&B sweep search space (lr, tau, effective batch)
+├── sweep_configs/       # per-model W&B sweep search spaces (lr, tau, effective batch)
 ├── data/
 │   └── SPairDataset.py  # SPair-71k pair dataset (images, keypoints, annotations)
 ├── models/

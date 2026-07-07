@@ -31,11 +31,13 @@ def parse_args():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--checkpoint", type=Path, required=False, help="path to checkpoint")
 
-    # W&B sweep (hyperparameter search on SPair small, runs before the actual training)
+    # W&B sweep (hyperparameter search, runs before the actual training;
+    # search space and split live in sweep_configs/<model>.yaml)
     common.add_argument("--skip-sweep", action="store_true", help="skip the hyperparameter search and use the CLI hyperparameters directly")
     common.add_argument("--sweep-id", type=str, default=None, help="id of an existing sweep to join")
     common.add_argument("--sweep-count", type=int, default=12, help="number of sweep runs")
-    common.add_argument("--sweep-name", type=str, default=None, help="name of the W&B sweep (default: <MODEL>-finetune; ignored with --sweep-id, the name is fixed at sweep creation)")
+    common.add_argument("--sweep-name", type=str, default=None, help="name of the W&B sweep (default: <MODEL>-uf<N>; ignored with --sweep-id, the name is fixed at sweep creation)")
+    common.add_argument("--sweep-config", type=Path, default=None, help="yaml with the sweep search space (default: sweep_configs/<model>.yaml)")
 
     # Hyperparameters: lr / tau / effective-batch are proposed by W&B during
     # the sweep; the CLI values are used only with --skip-sweep
@@ -297,23 +299,30 @@ def sweep_entry(args):
             unfreeze_layers=args.unfreeze_layers,  # fisso da CLI per tutta la pipeline
             tau=config.tau,
             effective_batch=config.effective_batch,
-            dataset_size='small',  # hyperparameter search on SPair small
+            # Costante dal sweep yaml; il fallback copre gli sweep creati
+            # prima che dataset_size diventasse un parametro del config
+            dataset_size=config.get("dataset_size", "large"),
         )
 
 
 def run_sweep(args) -> dict:
     """
-    Hyperparameter search with a W&B sweep on SPair small.
+    Hyperparameter search with a W&B sweep, on the SPair split set in the
+    sweep config (dataset_size).
 
     return: hyperparameters of the best run (highest val/pck_0.10)
     """
-    # Search space e pruning vivono in sweep_config.yaml; il nome dello sweep
-    # arriva da --sweep-name, con fallback sul modello scelto da CLI
-    with open(PROJECT_ROOT / "sweep_config.yaml", encoding="utf-8") as f:
+    # Search space, split e pruning vivono in un yaml per modello sotto
+    # sweep_configs/ (override con --sweep-config); il nome dello sweep
+    # arriva da --sweep-name, con fallback su modello + unfreeze
+    config_path = args.sweep_config or PROJECT_ROOT / "sweep_configs" / f"{args.model.lower()}.yaml"
+    with open(config_path, encoding="utf-8") as f:
         sweep_config = yaml.safe_load(f)
-    sweep_config["name"] = args.sweep_name or f"{args.model}-finetune"
+    sweep_config["name"] = args.sweep_name or f"{args.model}-uf{args.unfreeze_layers}"
 
-    print(f"Launching W&B sweep for {args.model}: {args.sweep_count} runs on SPair small")
+    # Stesso fallback di sweep_entry per yaml senza il parametro dataset_size
+    dataset = sweep_config["parameters"].get("dataset_size", {}).get("value", "large")
+    print(f"Launching W&B sweep for {args.model}: {args.sweep_count} runs on SPair {dataset} ({config_path.name})")
     sweep_id = args.sweep_id or wandb.sweep(sweep_config, project=args.wandb_project)
     wandb.agent(sweep_id, function=lambda: sweep_entry(args), count=args.sweep_count, project=args.wandb_project)
 
@@ -358,7 +367,8 @@ def main():
             "effective_batch": args.effective_batch,
         }
     else:
-        # Hyperparameter search on SPair small before the actual training
+        # Hyperparameter search before the actual training (the split is
+        # set by dataset_size in the model's sweep yaml)
         best_hparams = run_sweep(args)
 
     # Actual training on SPair large. unfreeze_layers e' fisso da CLI per

@@ -1,0 +1,25 @@
+# W&B sweep search space for SAM, auto-selected by train.py when
+# launching `train.py SAM` (override with --sweep-config).
+# Never swept yet: placeholder inherited from dinov3.yaml — refine
+# after the first SAM sweep.
+method: bayes
+metric:
+  name: val/pck_0.10
+  goal: maximize
+parameters:
+  # Constant for every run: SPair split the search runs on (the final
+  # training after the sweep always uses large)
+  dataset_size:
+    value: large
+  lr:
+    distribution: log_uniform_values
+    min: 2.0e-6
+    max: 3.0e-5
+  tau:
+    values: [0.02, 0.05]
+  effective_batch:
+    values: [16, 32, 64]
+early_terminate:
+  type: hyperband
+  min_iter: 2
+  eta: 3
